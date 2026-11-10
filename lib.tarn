@@ -22,16 +22,153 @@ pub fn Error.new(kind ErrorKind, message string) Error {
 }
 
 pub struct Config {
-    pub host string
-    pub port u16
+    pub host     string
+    pub port     u16
+    // Empty username means the legacy single-password AUTH form.
+    pub username string
+    // Empty password skips AUTH.
+    pub password string
+    // Logical database selected after connecting (SELECT); 0 is the default.
+    pub database u64
 }
 
 pub fn Config.new(host string, port u16) Config {
-    return Config{host: host, port: port}
+    return Config{host: host, port: port, username: "", password: "", database: 0}
 }
 
 pub fn Config.default() Config {
-    return Config{host: "127.0.0.1", port: 6379}
+    return Config.new("127.0.0.1", 6379)
+}
+
+fn hex_value(b u8) Option<u8> {
+    if b >= 48 && b <= 57 { return Some(b - 48) }
+    if b >= 97 && b <= 102 { return Some(b - 87) }
+    if b >= 65 && b <= 70 { return Some(b - 55) }
+    return None
+}
+
+// Decodes %XX escapes. NUL bytes and malformed escapes are rejected so a
+// credential can never be silently truncated or altered.
+fn percent_decode(value &string) Result<string, Error> {
+    raw := value.bytes()
+    var out: Vec<u8> = Vec.new()
+    var i = usize(0)
+    for {
+        if i >= raw.len() { break }
+        b := raw[i]
+        if b == 37 {
+            if i + 2 >= raw.len() {
+                return Err(Error.new(ErrorKind.ConnectionFailed, "Malformed percent escape in Redis URL"))
+            }
+            hi := match hex_value(raw[i + 1]) { Some(v) => v
+                None => { return Err(Error.new(ErrorKind.ConnectionFailed, "Malformed percent escape in Redis URL")) } }
+            lo := match hex_value(raw[i + 2]) { Some(v) => v
+                None => { return Err(Error.new(ErrorKind.ConnectionFailed, "Malformed percent escape in Redis URL")) } }
+            decoded := hi * 16 + lo
+            if decoded == 0 { return Err(Error.new(ErrorKind.ConnectionFailed, "NUL byte in Redis URL")) }
+            out.push(decoded)
+            i = i + 3
+        } else {
+            out.push(b)
+            i = i + 1
+        }
+    }
+    match string.from_utf8(out.as_slice()) {
+        Some(text) => return Ok(text)
+        None => return Err(Error.new(ErrorKind.ConnectionFailed, "Redis URL credentials are not valid UTF-8"))
+    }
+}
+
+fn last_byte(value &string, needle u8) Option<usize> {
+    raw := value.bytes()
+    var found: Option<usize> = None
+    for i in 0..raw.len() {
+        if raw[i] == needle { found = Some(i) }
+    }
+    return found
+}
+
+fn first_byte(value &string, needle u8) Option<usize> {
+    raw := value.bytes()
+    for i in 0..raw.len() {
+        if raw[i] == needle { return Some(i) }
+    }
+    return None
+}
+
+fn part(value &string, start usize, end usize) string {
+    return string.slice(value, start, end).unwrap_or("")
+}
+
+// Parses redis://[[username]:password@]host[:port][/database].
+// rediss:// (TLS) is rejected rather than silently downgraded to plain TCP.
+pub fn Config.from_url(url &string) Result<Config, Error> {
+    if string.starts_with(url, &"rediss://") {
+        return Err(Error.new(ErrorKind.ConnectionFailed, "rediss:// (TLS) is not supported yet; use an internal redis:// URL"))
+    }
+    if !string.starts_with(url, &"redis://") {
+        return Err(Error.new(ErrorKind.ConnectionFailed, "Redis URL must start with redis://"))
+    }
+    rest := part(url, 8, url.len())
+    match first_byte(&rest, 63) { Some(_) => { return Err(Error.new(ErrorKind.ConnectionFailed, "Redis URL query parameters are not supported")) }
+        None => {} }
+    match first_byte(&rest, 35) { Some(_) => { return Err(Error.new(ErrorKind.ConnectionFailed, "Redis URL fragments are not supported")) }
+        None => {} }
+    var cfg = Config.default()
+    var authority = rest.clone()
+    match last_byte(&rest, 64) { // '@'
+        Some(at) => {
+            userinfo := part(&rest, 0, at)
+            authority = part(&rest, at + 1, rest.len())
+            match first_byte(&userinfo, 58) { // ':'
+                Some(colon) => {
+                    cfg.username = try percent_decode(&part(&userinfo, 0, colon))
+                    cfg.password = try percent_decode(&part(&userinfo, colon + 1, userinfo.len()))
+                }
+                None => { cfg.password = try percent_decode(&userinfo) }
+            }
+        }
+        None => {}
+    }
+    var hostport = authority.clone()
+    match first_byte(&authority, 47) { // '/'
+        Some(slash) => {
+            hostport = part(&authority, 0, slash)
+            db := part(&authority, slash + 1, authority.len())
+            if db.len() > 0 {
+                cfg.database = match string.parse_u64(&db) { Some(n) => n
+                    None => { return Err(Error.new(ErrorKind.ConnectionFailed, "Redis database must be a number")) } }
+            }
+        }
+        None => {}
+    }
+    var port_text = ""
+    if string.starts_with(&hostport, &"[") {
+        close := match first_byte(&hostport, 93) { Some(i) => i
+            None => { return Err(Error.new(ErrorKind.ConnectionFailed, "Unterminated IPv6 host in Redis URL")) } }
+        cfg.host = part(&hostport, 0, close + 1)
+        tail := part(&hostport, close + 1, hostport.len())
+        if tail.len() > 0 {
+            if !string.starts_with(&tail, &":") { return Err(Error.new(ErrorKind.ConnectionFailed, "Invalid Redis URL host")) }
+            port_text = part(&tail, 1, tail.len())
+        }
+    } else {
+        match first_byte(&hostport, 58) {
+            Some(colon) => {
+                cfg.host = part(&hostport, 0, colon)
+                port_text = part(&hostport, colon + 1, hostport.len())
+            }
+            None => { cfg.host = hostport.clone() }
+        }
+    }
+    if cfg.host.len() == 0 { return Err(Error.new(ErrorKind.ConnectionFailed, "Redis URL is missing a host")) }
+    if port_text.len() > 0 {
+        port := match string.parse_u64(&port_text) { Some(n) => n
+            None => { return Err(Error.new(ErrorKind.ConnectionFailed, "Redis port must be a number")) } }
+        if port == 0 || port > 65535 { return Err(Error.new(ErrorKind.ConnectionFailed, "Redis port is out of range")) }
+        cfg.port = u16(port)
+    }
+    return Ok(cfg)
 }
 
 // --- RESP Value Model ---
@@ -349,6 +486,16 @@ pub fn Client.connect(cfg Config) Result<Client, Error> {
     var client = Client{
         stream: stream,
         reader: StreamReader.new()
+    }
+    if cfg.password.len() > 0 {
+        if cfg.username.len() > 0 {
+            try client.execute(format_cmd_3(&"AUTH", &cfg.username, &cfg.password))
+        } else {
+            try client.execute(format_cmd_2(&"AUTH", &cfg.password))
+        }
+    }
+    if cfg.database > 0 {
+        try client.execute(format_cmd_2(&"SELECT", &string.from_u64(cfg.database)))
     }
     try client.ping()
     return Ok(client)

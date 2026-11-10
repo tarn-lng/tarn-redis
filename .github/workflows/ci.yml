@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/tarn-lng/tarn:0.4.0
+    services:
+      valkey:
+        image: valkey/valkey:8.1
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Verify and test with official Tarn container
+        env:
+          REDIS_URL: redis://valkey:6379/1
+          # The server has no password, so any AUTH must be refused.
+          REDIS_BAD_AUTH_URL: redis://:wrong@valkey:6379
+        run: |
+          tarn version
+          tarn check lib.tarn
+          tarn test tests.tarn

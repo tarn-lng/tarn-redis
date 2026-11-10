@@ -14,6 +14,8 @@ Implements the REdis Serialization Protocol (RESP) directly over native TCP sock
   - Integers (`:`)
   - Bulk Strings (`$`) with NULL support (`$-1`)
   - Arrays (`*`) with recursive element parsing
+- **Authentication**: password (`AUTH pass`) and ACL users (`AUTH user pass`), plus `SELECT` of a logical database.
+- **Connection URLs**: `redis://[[user]:password@]host[:port][/db]`, percent-decoded and strictly validated. `rediss://` (TLS) is rejected rather than silently downgraded.
 - **Data Structures Supported**:
   - **Connection**: `ping()`, `echo()`, `close()`
   - **Strings / KV**: `set()`, `set_ex()`, `get()`, `del()`, `exists()`, `incr()`, `decr()`, `incr_by()`
@@ -35,7 +37,7 @@ docker run -d --name tarn-redis -p 6379:6379 redis:7-alpine
 import "redis"
 
 fn main() {
-    cfg := redis.Config.default() // 127.0.0.1:6379
+    cfg := redis.Config.default() // 127.0.0.1:6379, no password
     var client = try redis.Client.connect(cfg)
 
     // Key-Value operations
@@ -63,25 +65,31 @@ fn main() {
 }
 ```
 
-### 3. Installation
+### 3. Connecting with a URL
 
-Add to your `tarn.toml`:
+Managed services (Render Key Value, Upstash, ...) hand out a connection URL:
 
-```toml
-[dependencies]
-redis = "0.1.0"
+```tarn
+cfg := try redis.Config.from_url(&"redis://red-abc123:6379")
+var client = try redis.Client.connect(cfg)
 ```
 
-Or install via CLI:
+On Render, use the Key Value's **internal** URL from a service in the same region. TLS (`rediss://`, used by external URLs) is not supported yet.
+
+### 4. Installation
 
 ```bash
-tarn add redis --registry https://tarn-lng.github.io/registry/
+tarn add @tarn-lng/redis
 ```
+
+Requires Tarn 0.4.0 or newer for scoped registry packages.
 
 ## Running the Tests
 
 ```bash
-tarn run main.tarn
+tarn test tests.tarn                                   # unit tests
+REDIS_URL=redis://127.0.0.1:6379 tarn test tests.tarn  # plus a real round trip
+tarn run main.tarn                                     # end-to-end demo against 127.0.0.1:6379
 ```
 
 ## License

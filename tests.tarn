@@ -1,0 +1,78 @@
+import "testing"
+import "os"
+import "lib"
+
+fn test_url_defaults_and_full_form(t &mut testing.T) {
+    plain := lib.Config.from_url("redis://cache.internal").unwrap()
+    t.eq(plain.host, "cache.internal")
+    t.eq(plain.port, u16(6379))
+    t.eq(plain.password, "")
+    t.eq(plain.database, u64(0))
+
+    full := lib.Config.from_url("redis://app:s3cret@red-abc:6380/2").unwrap()
+    t.eq(full.username, "app")
+    t.eq(full.password, "s3cret")
+    t.eq(full.host, "red-abc")
+    t.eq(full.port, u16(6380))
+    t.eq(full.database, u64(2))
+}
+
+fn test_url_password_only_and_percent_decoding(t &mut testing.T) {
+    legacy := lib.Config.from_url("redis://:p%40ss%3Aword@localhost").unwrap()
+    t.eq(legacy.username, "")
+    t.eq(legacy.password, "p@ss:word")
+    // The last '@' separates credentials, so an unescaped '@' in a password survives.
+    raw := lib.Config.from_url("redis://:a@b@localhost:7000").unwrap()
+    t.eq(raw.password, "a@b")
+    t.eq(raw.port, u16(7000))
+    ipv6 := lib.Config.from_url("redis://[::1]:6390").unwrap()
+    t.eq(ipv6.host, "[::1]")
+    t.eq(ipv6.port, u16(6390))
+}
+
+fn test_url_rejects_unsafe_or_ambiguous_input(t &mut testing.T) {
+    t.err(&lib.Config.from_url("rediss://secure:6379"))
+    t.err(&lib.Config.from_url("http://localhost"))
+    t.err(&lib.Config.from_url("redis://"))
+    t.err(&lib.Config.from_url("redis://localhost:0"))
+    t.err(&lib.Config.from_url("redis://localhost:65536"))
+    t.err(&lib.Config.from_url("redis://localhost:port"))
+    t.err(&lib.Config.from_url("redis://localhost/db"))
+    t.err(&lib.Config.from_url("redis://:pa%00ss@localhost"))
+    t.err(&lib.Config.from_url("redis://:pa%zzss@localhost"))
+    t.err(&lib.Config.from_url("redis://:pass%4@localhost"))
+    t.err(&lib.Config.from_url("redis://localhost?timeout=1"))
+    t.err(&lib.Config.from_url("redis://[::1"))
+}
+
+// Runs only when REDIS_URL points at a disposable server (CI uses Valkey).
+fn test_round_trip_against_real_server(t &mut testing.T) {
+    url := match os.env("REDIS_URL") {
+        Ok(Some(value)) => value
+        _ => {
+            t.skip("REDIS_URL is not set")
+            return
+        }
+    }
+    cfg := lib.Config.from_url(&url).unwrap()
+    var client = lib.Client.connect(cfg).unwrap()
+    key := "tarn-redis:test:round-trip"
+    client.set_ex(&key, 30, "value with spaces\r\nand CRLF").unwrap()
+    got := client.get(&key).unwrap()
+    t.eq(got.unwrap_or(""), "value with spaces\r\nand CRLF")
+    t.eq(client.del(&key).unwrap(), i64(1))
+    t.none(&client.get(&key).unwrap())
+    client.close().unwrap()
+}
+
+fn test_wrong_password_is_rejected(t &mut testing.T) {
+    url := match os.env("REDIS_BAD_AUTH_URL") {
+        Ok(Some(value)) => value
+        _ => {
+            t.skip("REDIS_BAD_AUTH_URL is not set")
+            return
+        }
+    }
+    cfg := lib.Config.from_url(&url).unwrap()
+    t.err(&lib.Client.connect(cfg))
+}
